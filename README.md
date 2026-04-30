@@ -1,6 +1,6 @@
 # KamglobalAI EPMS
 
-Enterprise Performance Management System (EPMS) built with Streamlit and SQLite.
+Enterprise Performance Management System (EPMS) built with Streamlit; uses SQLite locally or PostgreSQL when `EPMS_DATABASE_URL` is set.
 
 ## Features
 
@@ -18,7 +18,7 @@ Enterprise Performance Management System (EPMS) built with Streamlit and SQLite.
 
 - Python
 - Streamlit
-- SQLite
+- SQLite or PostgreSQL (via SQLAlchemy)
 - Plotly
 - Pandas
 - ReportLab
@@ -78,6 +78,86 @@ Change password immediately after first login.
   - `EPMS_DATABASE_URL` (optional, example: `postgresql+psycopg2://user:pass@host:5432/epms`)
   - `EPMS_ADMIN_USERNAME` (default: `admin`)
   - `EPMS_ADMIN_PASSWORD` (default: `Admin@123`)
+  - Email (SMTP / AWS SES SMTP):
+    - `EPMS_SMTP_HOST`, `EPMS_SMTP_PORT`, `EPMS_SMTP_USERNAME`, `EPMS_SMTP_PASSWORD`
+    - `EPMS_EMAIL_FROM`, `EPMS_SMTP_STARTTLS`
+
+## AWS Deployment (Recommended: RDS + ECS/Fargate + SES SMTP)
+
+This app is container-ready (see `Dockerfile`). The common AWS production setup is:
+
+- **RDS PostgreSQL** for persistence
+- **ECS/Fargate** to run the Streamlit container
+- **Application Load Balancer (ALB)** + **ACM** for HTTPS + custom domain
+- **SES** for outgoing email (via SMTP)
+
+### 1) Create RDS PostgreSQL
+
+- **Engine**: PostgreSQL 15+ (any supported version is OK)
+- **Public access**: No (recommended)
+- **Security Group**:
+  - Inbound: allow TCP `5432` from the **ECS task security group** only
+- Note the endpoint, DB name, username, password.
+
+Set `EPMS_DATABASE_URL` like:
+
+`postgresql+psycopg2://USER:PASSWORD@RDS_ENDPOINT:5432/DBNAME`
+
+### 2) Enable AWS SES (Email)
+
+- Verify a sender identity (domain or email) in SES.
+- Request production access if SES is in sandbox.
+- Create **SMTP credentials** in SES (these are different from IAM keys).
+
+Set:
+
+- `EPMS_SMTP_HOST`: e.g. `email-smtp.us-east-1.amazonaws.com`
+- `EPMS_SMTP_PORT`: `587`
+- `EPMS_SMTP_USERNAME` / `EPMS_SMTP_PASSWORD`: from SES SMTP credentials
+- `EPMS_EMAIL_FROM`: verified sender (e.g. `noreply@yourdomain.com`)
+- `EPMS_SMTP_STARTTLS`: `true`
+
+### 3) Push image to ECR
+
+- Create an ECR repository (e.g. `kpi-epms`).
+- Build and push:
+
+```powershell
+aws ecr get-login-password --region <region> | docker login --username AWS --password-stdin <acct>.dkr.ecr.<region>.amazonaws.com
+docker build -t kpi-epms .
+docker tag kpi-epms:latest <acct>.dkr.ecr.<region>.amazonaws.com/kpi-epms:latest
+docker push <acct>.dkr.ecr.<region>.amazonaws.com/kpi-epms:latest
+```
+
+### 4) Create ECS/Fargate service
+
+- **Cluster**: Fargate
+- **Task definition**:
+  - Container port: `8501`
+  - Health check (ALB): path `/` (Streamlit responds with 200)
+  - Logging: CloudWatch Logs
+  - Environment variables (set in task definition), **do not use `.env` in production**:
+    - `EPMS_DATABASE_URL`
+    - `EPMS_ADMIN_USERNAME`, `EPMS_ADMIN_PASSWORD`, `EPMS_ENABLE_ADMIN_SEED`
+    - `EPMS_SMTP_*` and `EPMS_EMAIL_FROM`
+  - Prefer AWS Secrets Manager for DB password and SMTP password
+- **Networking**:
+  - Private subnets (recommended)
+  - Security group inbound: allow `8501` from the ALB security group only
+
+### 5) Add an ALB + HTTPS
+
+- Create an **Application Load Balancer** in public subnets.
+- Listener 80 → redirect to 443
+- Listener 443 with **ACM** certificate for your domain
+- Target group → ECS service port 8501
+- Route53 record → ALB DNS
+
+### 6) Verify and operate
+
+- Watch logs in CloudWatch.
+- Run DB migrations by simply starting the app (it auto-initializes schema).
+- For updates: build/push new image → update ECS service to new task revision.
   - `EPMS_ENABLE_ADMIN_SEED` (`true`/`false`, default: `true`)
 
 ## Modular Structure

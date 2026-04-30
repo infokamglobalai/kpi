@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-import pandas as pd
+from sqlalchemy import text
 
 from epms.auth import generate_salt, hash_password
+from epms.schema_meta import table_columns
+from epms.sql_engine import get_engine
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -25,11 +26,31 @@ def init_db(
     default_admin_password: str,
     log_audit_callback,
 ) -> None:
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            """
+    del db_path
+    engine = get_engine()
+    dialect = engine.dialect.name
+    with engine.begin() as conn:
+        _create_tables(conn, dialect)
+        _ensure_user_extra_columns(conn, dialect)
+        _ensure_scorecard_extra_columns(conn, dialect)
+        seed_review_cycles(conn, dialect, review_cycles)
+        if env_bool("EPMS_ENABLE_ADMIN_SEED", True):
+            seed_default_admin(conn, dialect, default_admin_username, default_admin_password, log_audit_callback)
+
+
+def _create_tables(conn, dialect: str) -> None:
+    if dialect == "postgresql":
+        id_pk = "SERIAL PRIMARY KEY"
+        user_active = "SMALLINT NOT NULL DEFAULT 1"
+    else:
+        id_pk = "INTEGER PRIMARY KEY AUTOINCREMENT"
+        user_active = "INTEGER NOT NULL DEFAULT 1"
+
+    conn.execute(
+        text(
+            f"""
             CREATE TABLE IF NOT EXISTS scorecards (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_pk},
                 created_at TEXT NOT NULL,
                 review_date TEXT NOT NULL,
                 employee_name TEXT NOT NULL,
@@ -48,24 +69,30 @@ def init_db(
             )
             """
         )
-        conn.execute(
-            """
+    )
+    conn.execute(
+        text(
+            f"""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_pk},
                 username TEXT UNIQUE NOT NULL,
                 role TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
                 password_salt TEXT NOT NULL,
                 manager_username TEXT,
-                is_active INTEGER NOT NULL DEFAULT 1,
+                department TEXT,
+                is_active {user_active},
                 created_at TEXT NOT NULL
             )
             """
         )
-        conn.execute(
-            """
+    )
+
+    conn.execute(
+        text(
+            f"""
             CREATE TABLE IF NOT EXISTS audit_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_pk},
                 created_at TEXT NOT NULL,
                 actor TEXT NOT NULL,
                 action TEXT NOT NULL,
@@ -75,7 +102,9 @@ def init_db(
             )
             """
         )
-        conn.execute(
+    )
+    conn.execute(
+        text(
             """
             CREATE TABLE IF NOT EXISTS review_cycles (
                 cycle_name TEXT PRIMARY KEY,
@@ -84,62 +113,91 @@ def init_db(
             )
             """
         )
-        _ensure_columns(conn)
-        _ensure_scorecard_columns(conn)
-        seed_review_cycles(conn, review_cycles)
-        if env_bool("EPMS_ENABLE_ADMIN_SEED", True):
-            seed_default_admin(conn, default_admin_username, default_admin_password, log_audit_callback)
+    )
+    conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS kpi_registry_overrides (
+                department TEXT NOT NULL,
+                role TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                current_value TEXT,
+                priority TEXT DEFAULT 'P2',
+                frequency TEXT DEFAULT 'Monthly',
+                status_override TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (department, role, metric)
+            )
+            """
+        )
+    )
 
 
-def _ensure_columns(conn: sqlite3.Connection) -> None:
-    user_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
-    if "manager_username" not in user_columns:
-        conn.execute("ALTER TABLE users ADD COLUMN manager_username TEXT")
+def _ensure_user_extra_columns(conn, dialect: str) -> None:
+    cols = table_columns(conn, dialect, "users")
+    if "manager_username" not in cols:
+        conn.execute(text("ALTER TABLE users ADD COLUMN manager_username TEXT"))
+    if "department" not in cols:
+        conn.execute(text("ALTER TABLE users ADD COLUMN department TEXT"))
 
 
-def _ensure_scorecard_columns(conn: sqlite3.Connection) -> None:
-    scorecard_columns = {row[1] for row in conn.execute("PRAGMA table_info(scorecards)").fetchall()}
-    desired_columns: dict[str, str] = {
+def _ensure_scorecard_extra_columns(conn, dialect: str) -> None:
+    cols = table_columns(conn, dialect, "scorecards")
+    desired = {
         "review_cycle": "TEXT",
         "status": "TEXT",
         "self_comment": "TEXT",
         "manager_comment": "TEXT",
         "evidence_url": "TEXT",
     }
-    for column_name, column_type in desired_columns.items():
-        if column_name not in scorecard_columns:
-            conn.execute(f"ALTER TABLE scorecards ADD COLUMN {column_name} {column_type}")
+    for column_name, column_type in desired.items():
+        if column_name not in cols:
+            conn.execute(text(f"ALTER TABLE scorecards ADD COLUMN {column_name} {column_type}"))
 
 
-def seed_review_cycles(conn: sqlite3.Connection, review_cycles: list[str]) -> None:
+def seed_review_cycles(conn, dialect: str, review_cycles: list[str]) -> None:
+    del dialect
     for cycle_name in review_cycles:
         existing = conn.execute(
-            "SELECT cycle_name FROM review_cycles WHERE cycle_name = ?",
-            (cycle_name,),
+            text("SELECT cycle_name FROM review_cycles WHERE cycle_name = :c"),
+            {"c": cycle_name},
         ).fetchone()
         if not existing:
             conn.execute(
-                "INSERT INTO review_cycles (cycle_name, is_closed, updated_at) VALUES (?, 0, ?)",
-                (cycle_name, datetime.now().isoformat()),
+                text(
+                    """
+                    INSERT INTO review_cycles (cycle_name, is_closed, updated_at)
+                    VALUES (:c, 0, :ts)
+                    """
+                ),
+                {"c": cycle_name, "ts": datetime.now().isoformat()},
             )
 
 
 def seed_default_admin(
-    conn: sqlite3.Connection,
+    conn,
+    dialect: str,
     username: str,
     password: str,
     log_audit_callback,
 ) -> None:
-    existing_admin = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    del dialect
+    existing_admin = conn.execute(
+        text("SELECT id FROM users WHERE username = :u"),
+        {"u": username},
+    ).fetchone()
     if existing_admin:
         return
+
     salt = generate_salt()
     password_hash = hash_password(password, salt)
     conn.execute(
-        """
-        INSERT INTO users (username, role, password_hash, password_salt, is_active, created_at)
-        VALUES (?, ?, ?, ?, 1, ?)
-        """,
-        (username, "Admin", password_hash, salt, datetime.now().isoformat()),
+        text(
+            """
+            INSERT INTO users (username, role, password_hash, password_salt, is_active, created_at)
+            VALUES (:u, 'Admin', :ph, :ps, 1, :ts)
+            """
+        ),
+        {"u": username, "ph": password_hash, "ps": salt, "ts": datetime.now().isoformat()},
     )
     log_audit_callback("SEED_ADMIN", "user", username, "Default admin created.")

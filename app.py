@@ -4,8 +4,8 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
-import sqlite3
 from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List
@@ -24,6 +24,11 @@ from epms import db_adapter as db_adapter_module
 from epms import db as db_module
 from epms import reports as reports_module
 from epms import ui as ui_module
+from epms.emailer import send_email_smtp
+from epms.schema_meta import insert_scorecard_returning_id
+from epms.sql_engine import dialect_name, get_engine
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 load_dotenv()
 
@@ -452,49 +457,10 @@ def init_db() -> None:
     )
 
 
-def _ensure_scorecard_columns(conn: sqlite3.Connection) -> None:
-    existing_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(scorecards)").fetchall()
-    }
-    desired_columns = {
-        "review_cycle": "TEXT",
-        "status": "TEXT",
-        "self_comment": "TEXT",
-        "manager_comment": "TEXT",
-        "evidence_url": "TEXT",
-    }
-    for column_name, column_type in desired_columns.items():
-        if column_name not in existing_columns:
-            conn.execute(f"ALTER TABLE scorecards ADD COLUMN {column_name} {column_type}")
-    user_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
-    if "manager_username" not in user_columns:
-        conn.execute("ALTER TABLE users ADD COLUMN manager_username TEXT")
-
-
-def seed_review_cycles(conn: sqlite3.Connection) -> None:
-    for cycle_name in REVIEW_CYCLES:
-        existing = conn.execute(
-            "SELECT cycle_name FROM review_cycles WHERE cycle_name = ?",
-            (cycle_name,),
-        ).fetchone()
-        if not existing:
-            conn.execute(
-                """
-                INSERT INTO review_cycles (cycle_name, is_closed, updated_at)
-                VALUES (?, 0, ?)
-                """,
-                (cycle_name, datetime.now().isoformat()),
-            )
-
-
 def fetch_review_cycles() -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_engine().connect() as conn:
         return pd.read_sql_query(
-            """
-            SELECT cycle_name, is_closed, updated_at
-            FROM review_cycles
-            ORDER BY cycle_name
-            """,
+            "SELECT cycle_name, is_closed, updated_at FROM review_cycles ORDER BY cycle_name",
             conn,
         )
 
@@ -502,23 +468,25 @@ def fetch_review_cycles() -> pd.DataFrame:
 def is_cycle_closed(cycle_name: str) -> bool:
     if not cycle_name:
         return False
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_engine().connect() as conn:
         row = conn.execute(
-            "SELECT is_closed FROM review_cycles WHERE cycle_name = ?",
-            (cycle_name,),
+            text("SELECT is_closed FROM review_cycles WHERE cycle_name = :c"),
+            {"c": cycle_name},
         ).fetchone()
     return bool(row[0]) if row else False
 
 
 def set_cycle_closed(cycle_name: str, is_closed: bool) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_engine().begin() as conn:
         conn.execute(
-            """
-            UPDATE review_cycles
-            SET is_closed = ?, updated_at = ?
-            WHERE cycle_name = ?
-            """,
-            (1 if is_closed else 0, datetime.now().isoformat(), cycle_name),
+            text(
+                """
+                UPDATE review_cycles
+                SET is_closed = :closed, updated_at = :ts
+                WHERE cycle_name = :c
+                """
+            ),
+            {"closed": 1 if is_closed else 0, "ts": datetime.now().isoformat(), "c": cycle_name},
         )
     state = "CLOSED" if is_closed else "OPENED"
     log_audit("UPDATE_CYCLE_STATUS", "review_cycle", cycle_name, f"Cycle={cycle_name};State={state}")
@@ -526,74 +494,49 @@ def set_cycle_closed(cycle_name: str, is_closed: bool) -> None:
 
 def log_audit(action: str, entity_type: str, entity_id: str, details: str) -> None:
     actor = st.session_state.get("username", "system")
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_engine().begin() as conn:
         conn.execute(
-            """
-            INSERT INTO audit_logs (created_at, actor, action, entity_type, entity_id, details)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (datetime.now().isoformat(), actor, action, entity_type, entity_id, details),
+            text(
+                """
+                INSERT INTO audit_logs (created_at, actor, action, entity_type, entity_id, details)
+                VALUES (:ts, :actor, :action, :etype, :eid, :details)
+                """
+            ),
+            {
+                "ts": datetime.now().isoformat(),
+                "actor": actor,
+                "action": action,
+                "etype": entity_type,
+                "eid": entity_id,
+                "details": details,
+            },
         )
-
-
-def seed_default_admin(conn: sqlite3.Connection) -> None:
-    existing_admin = conn.execute(
-        "SELECT id FROM users WHERE username = ?",
-        (DEFAULT_ADMIN_USERNAME,),
-    ).fetchone()
-    if existing_admin:
-        return
-
-    salt = generate_salt()
-    password_hash = hash_password(DEFAULT_ADMIN_PASSWORD, salt)
-    conn.execute(
-        """
-        INSERT INTO users (username, role, password_hash, password_salt, is_active, created_at)
-        VALUES (?, ?, ?, ?, 1, ?)
-        """,
-        (
-            DEFAULT_ADMIN_USERNAME,
-            "Admin",
-            password_hash,
-            salt,
-            datetime.now().isoformat(),
-        ),
-    )
-    log_audit("SEED_ADMIN", "user", DEFAULT_ADMIN_USERNAME, "Default admin created.")
 
 
 def save_scorecard(record: Dict[str, str | float]) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO scorecards (
-                created_at, review_date, employee_name, department, role,
-                final_score, rating, kpi_json, breakdown_json, created_by,
-                review_cycle, status, self_comment, manager_comment, evidence_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(record["created_at"]),
-                str(record["review_date"]),
-                str(record["employee_name"]),
-                str(record["department"]),
-                str(record["role"]),
-                float(record["final_score"]),
-                str(record["rating"]),
-                str(record["kpi_json"]),
-                str(record["breakdown_json"]),
-                str(record["created_by"]),
-                str(record.get("review_cycle", "")),
-                str(record.get("status", "Submitted")),
-                str(record.get("self_comment", "")),
-                str(record.get("manager_comment", "")),
-                str(record.get("evidence_url", "")),
-            ),
-        )
+    params = {
+        "created_at": str(record["created_at"]),
+        "review_date": str(record["review_date"]),
+        "employee_name": str(record["employee_name"]),
+        "department": str(record["department"]),
+        "role": str(record["role"]),
+        "final_score": float(record["final_score"]),
+        "rating": str(record["rating"]),
+        "kpi_json": str(record["kpi_json"]),
+        "breakdown_json": str(record["breakdown_json"]),
+        "created_by": str(record["created_by"]),
+        "review_cycle": str(record.get("review_cycle", "")),
+        "status": str(record.get("status", "Submitted")),
+        "self_comment": str(record.get("self_comment", "")),
+        "manager_comment": str(record.get("manager_comment", "")),
+        "evidence_url": str(record.get("evidence_url", "")),
+    }
+    with get_engine().begin() as conn:
+        new_id = insert_scorecard_returning_id(conn, dialect_name(), params)
     log_audit(
         "CREATE_SCORECARD",
         "scorecard",
-        str(cursor.lastrowid),
+        str(new_id),
         f"Employee={record['employee_name']}; Department={record['department']}; Role={record['role']}",
     )
 
@@ -613,30 +556,34 @@ def update_scorecard(
     self_comment: str,
     evidence_url: str,
 ) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_engine().begin() as conn:
         conn.execute(
-            """
-            UPDATE scorecards
-            SET review_date = ?, employee_name = ?, department = ?, role = ?,
-                final_score = ?, rating = ?, kpi_json = ?, breakdown_json = ?,
-                review_cycle = ?, status = ?, self_comment = ?, evidence_url = ?
-            WHERE id = ?
-            """,
-            (
-                review_date,
-                employee_name,
-                department,
-                role,
-                final_score,
-                rating,
-                kpi_json,
-                breakdown_json,
-                review_cycle,
-                status,
-                self_comment,
-                evidence_url,
-                scorecard_id,
+            text(
+                """
+                UPDATE scorecards
+                SET review_date = :review_date, employee_name = :employee_name, department = :department,
+                    role = :role, final_score = :final_score, rating = :rating,
+                    kpi_json = :kpi_json, breakdown_json = :breakdown_json,
+                    review_cycle = :review_cycle, status = :status,
+                    self_comment = :self_comment, evidence_url = :evidence_url
+                WHERE id = :id
+                """
             ),
+            {
+                "review_date": review_date,
+                "employee_name": employee_name,
+                "department": department,
+                "role": role,
+                "final_score": final_score,
+                "rating": rating,
+                "kpi_json": kpi_json,
+                "breakdown_json": breakdown_json,
+                "review_cycle": review_cycle,
+                "status": status,
+                "self_comment": self_comment,
+                "evidence_url": evidence_url,
+                "id": scorecard_id,
+            },
         )
     log_audit("UPDATE_SCORECARD", "scorecard", str(scorecard_id), f"Status={status}")
 
@@ -647,43 +594,45 @@ def fetch_scorecards(
     review_cycle: str | None = None,
     status: str | None = None,
 ) -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as conn:
-        query = """
+    query = """
             SELECT
                 id, created_at, review_date, employee_name, department, role,
                 final_score, rating, created_by, review_cycle, status, self_comment, manager_comment, evidence_url
             FROM scorecards
             WHERE 1=1
         """
-        params: list[str] = []
-        if department:
-            query += " AND department = ?"
-            params.append(department)
-        if role:
-            query += " AND role = ?"
-            params.append(role)
-        if review_cycle:
-            query += " AND review_cycle = ?"
-            params.append(review_cycle)
-        if status:
-            query += " AND status = ?"
-            params.append(status)
-        query += " ORDER BY id DESC"
-        return pd.read_sql_query(query, conn, params=params)
+    params: dict[str, str] = {}
+    if department:
+        query += " AND department = :department"
+        params["department"] = department
+    if role:
+        query += " AND role = :role"
+        params["role"] = role
+    if review_cycle:
+        query += " AND review_cycle = :review_cycle"
+        params["review_cycle"] = review_cycle
+    if status:
+        query += " AND status = :status"
+        params["status"] = status
+    query += " ORDER BY id DESC"
+    with get_engine().connect() as conn:
+        return pd.read_sql_query(text(query), conn, params=params or None)
 
 
 def fetch_scorecard_by_id(scorecard_id: int) -> dict | None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_engine().connect() as conn:
         row = conn.execute(
-            """
-            SELECT
-                id, review_date, employee_name, department, role,
-                final_score, rating, kpi_json, breakdown_json, created_by,
-                review_cycle, status, self_comment, manager_comment, evidence_url
-            FROM scorecards
-            WHERE id = ?
-            """,
-            (scorecard_id,),
+            text(
+                """
+                SELECT
+                    id, review_date, employee_name, department, role,
+                    final_score, rating, kpi_json, breakdown_json, created_by,
+                    review_cycle, status, self_comment, manager_comment, evidence_url
+                FROM scorecards
+                WHERE id = :id
+                """
+            ),
+            {"id": scorecard_id},
         ).fetchone()
     if not row:
         return None
@@ -707,14 +656,16 @@ def fetch_scorecard_by_id(scorecard_id: int) -> dict | None:
 
 
 def update_scorecard_workflow(scorecard_id: int, status: str, manager_comment: str) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_engine().begin() as conn:
         conn.execute(
-            """
-            UPDATE scorecards
-            SET status = ?, manager_comment = ?
-            WHERE id = ?
-            """,
-            (status, manager_comment, scorecard_id),
+            text(
+                """
+                UPDATE scorecards
+                SET status = :status, manager_comment = :mcomment
+                WHERE id = :id
+                """
+            ),
+            {"status": status, "mcomment": manager_comment, "id": scorecard_id},
         )
     log_audit(
         "UPDATE_WORKFLOW",
@@ -725,28 +676,33 @@ def update_scorecard_workflow(scorecard_id: int, status: str, manager_comment: s
 
 
 def fetch_audit_logs(limit: int = 300) -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as conn:
+    lim = max(1, min(int(limit), 5000))
+    with get_engine().connect() as conn:
         return pd.read_sql_query(
-            """
-            SELECT created_at, actor, action, entity_type, entity_id, details
-            FROM audit_logs
-            ORDER BY id DESC
-            LIMIT ?
-            """,
+            text(
+                """
+                SELECT created_at, actor, action, entity_type, entity_id, details
+                FROM audit_logs
+                ORDER BY id DESC
+                LIMIT :lim
+                """
+            ),
             conn,
-            params=[limit],
+            params={"lim": lim},
         )
 
 
 def get_user_by_username(username: str) -> dict | None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_engine().connect() as conn:
         row = conn.execute(
-            """
-            SELECT username, role, password_hash, password_salt, is_active, manager_username
-            FROM users
-            WHERE username = ?
-            """,
-            (username,),
+            text(
+                """
+                SELECT username, role, password_hash, password_salt, is_active, manager_username, department
+                FROM users
+                WHERE username = :u
+                """
+            ),
+            {"u": username},
         ).fetchone()
     if not row:
         return None
@@ -757,10 +713,17 @@ def get_user_by_username(username: str) -> dict | None:
         "password_salt": row[3],
         "is_active": bool(row[4]),
         "manager_username": row[5] or "",
+        "department": row[6] or "",
     }
 
 
-def create_user(username: str, password: str, role: str, manager_username: str = "") -> tuple[bool, str]:
+def create_user(
+    username: str,
+    password: str,
+    role: str,
+    manager_username: str = "",
+    department: str = "",
+) -> tuple[bool, str]:
     username = username.strip().lower()
     if len(username) < 3:
         return False, "Username must be at least 3 characters."
@@ -769,25 +732,45 @@ def create_user(username: str, password: str, role: str, manager_username: str =
 
     salt = generate_salt()
     password_hash = hash_password(password, salt)
+    mgr = manager_username.strip() if manager_username and manager_username.strip() else None
+    dept = department.strip() if department and department.strip() else None
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with get_engine().begin() as conn:
             conn.execute(
-                """
-                INSERT INTO users (username, role, password_hash, password_salt, manager_username, is_active, created_at)
-                VALUES (?, ?, ?, ?, ?, 1, ?)
-                """,
-                (username, role, password_hash, salt, manager_username or None, datetime.now().isoformat()),
+                text(
+                    """
+                    INSERT INTO users (
+                        username, role, password_hash, password_salt,
+                        manager_username, department, is_active, created_at
+                    )
+                    VALUES (:u, :role, :ph, :ps, :mgr, :dept, 1, :ts)
+                    """
+                ),
+                {
+                    "u": username,
+                    "role": role,
+                    "ph": password_hash,
+                    "ps": salt,
+                    "mgr": mgr,
+                    "dept": dept,
+                    "ts": datetime.now().isoformat(),
+                },
             )
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return False, "Username already exists."
-    log_audit("CREATE_USER", "user", username, f"Role={role};Manager={manager_username or '-'}")
+    log_audit(
+        "CREATE_USER",
+        "user",
+        username,
+        f"Role={role};Manager={manager_username or '-'};Dept={department or '-'}",
+    )
     return True, "User created successfully."
 
 
 def fetch_users() -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_engine().connect() as conn:
         query = """
-            SELECT id, username, role, manager_username, is_active, created_at
+            SELECT id, username, role, manager_username, department, is_active, created_at
             FROM users
             ORDER BY username ASC
         """
@@ -797,14 +780,16 @@ def fetch_users() -> pd.DataFrame:
 
 
 def fetch_team_usernames(manager_username: str) -> list[str]:
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_engine().connect() as conn:
         rows = conn.execute(
-            """
-            SELECT username
-            FROM users
-            WHERE manager_username = ? AND is_active = 1
-            """,
-            (manager_username,),
+            text(
+                """
+                SELECT username
+                FROM users
+                WHERE manager_username = :m AND is_active = 1
+                """
+            ),
+            {"m": manager_username},
         ).fetchall()
     return [row[0] for row in rows]
 
@@ -812,8 +797,12 @@ def fetch_team_usernames(manager_username: str) -> list[str]:
 def get_visible_scorecards_for_current_user(**filters: str | None) -> pd.DataFrame:
     role = st.session_state.role
     username = st.session_state.username
+    user_dept = (st.session_state.get("user_department") or "").strip()
+    eff_department = filters.get("department")
+    if role in ("Employee", "Manager") and user_dept and not eff_department:
+        eff_department = user_dept
     df = fetch_scorecards(
-        department=filters.get("department"),
+        department=eff_department,
         role=filters.get("role"),
         review_cycle=filters.get("review_cycle"),
         status=filters.get("status"),
@@ -821,6 +810,8 @@ def get_visible_scorecards_for_current_user(**filters: str | None) -> pd.DataFra
     if df.empty:
         return df
     if role == "Admin":
+        return df
+    if role == "Viewer":
         return df
     if role == "Manager":
         team = set(fetch_team_usernames(username))
@@ -858,11 +849,362 @@ def can_edit_scorecard(record: dict, role: str, username: str) -> tuple[bool, st
     return False, "Your role does not permit editing."
 
 
-def set_user_status(username: str, is_active: bool) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+KPI_PRIORITY_OPTIONS = ["P1", "P2", "P3"]
+KPI_FREQUENCY_OPTIONS = ["Daily", "Weekly", "Monthly", "Quarterly", "Annual", "Per Deal"]
+KPI_TRACKING_OPTIONS = ["Auto", "Achieved", "On Track", "At Risk", "Behind", "Not Set"]
+
+
+def derive_kpi_status(target: str, current: str) -> str:
+    cur = (current or "").strip()
+    if not cur:
+        return "Not Set"
+    tgt = (target or "").strip()
+    tl = tgt.lower()
+    if "zero" in tl or tl == "zero":
+        cl = cur.strip().lower()
+        if cl in ("0", "zero", "none", "no"):
+            return "Achieved"
+        return "Behind"
+    nums_t = re.findall(r"[\d.]+", tgt.replace(",", ""))
+    nums_c = re.findall(r"[\d.]+", cur.replace(",", ""))
+    if nums_t and nums_c:
+        try:
+            t = float(nums_t[0])
+            c = float(nums_c[0])
+            if "<=" in tgt or bool(re.search(r"<\s*\d", tgt)):
+                if c <= t:
+                    return "Achieved"
+                return "At Risk" if c <= t * 1.2 else "Behind"
+            if ">=" in tgt or "≥" in tgt or "> " in tgt:
+                if c >= t:
+                    return "Achieved"
+                return "At Risk" if c >= t * 0.9 else "Behind"
+            if "%" in tgt or "%" in cur:
+                if c >= t * 0.98:
+                    return "Achieved"
+                return "At Risk" if c >= t * 0.85 else "Behind"
+        except ValueError:
+            pass
+    return "On Track"
+
+
+def fetch_kpi_overrides() -> Dict[tuple[str, str, str], Dict[str, str | None]]:
+    with get_engine().connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT department, role, metric, current_value, priority, frequency, status_override
+                FROM kpi_registry_overrides
+                """
+            )
+        ).fetchall()
+    out: Dict[tuple[str, str, str], Dict[str, str | None]] = {}
+    for r in rows:
+        out[(r[0], r[1], r[2])] = {
+            "current_value": r[3] or "",
+            "priority": r[4] or "P2",
+            "frequency": r[5] or "Monthly",
+            "status_override": r[6],
+        }
+    return out
+
+
+def upsert_kpi_registry_row(
+    department: str,
+    role: str,
+    metric: str,
+    current_value: str,
+    priority: str,
+    frequency: str,
+    status_override: str | None,
+) -> None:
+    ts = datetime.now().isoformat()
+    so = status_override if status_override and status_override != "Auto" else None
+    with get_engine().begin() as conn:
         conn.execute(
-            "UPDATE users SET is_active = ? WHERE username = ?",
-            (1 if is_active else 0, username),
+            text(
+                """
+                INSERT INTO kpi_registry_overrides (
+                    department, role, metric, current_value, priority, frequency, status_override, updated_at
+                ) VALUES (
+                    :dept, :role, :metric, :cur, :prio, :freq, :so, :ts
+                )
+                ON CONFLICT(department, role, metric) DO UPDATE SET
+                    current_value = excluded.current_value,
+                    priority = excluded.priority,
+                    frequency = excluded.frequency,
+                    status_override = excluded.status_override,
+                    updated_at = excluded.updated_at
+                """
+            ),
+            {
+                "dept": department,
+                "role": role,
+                "metric": metric,
+                "cur": current_value,
+                "prio": priority,
+                "freq": frequency,
+                "so": so,
+                "ts": ts,
+            },
+        )
+    log_audit(
+        "KPI_REGISTRY_UPSERT",
+        "kpi_registry",
+        f"{department}:{role}:{metric}",
+        "Registry row saved",
+    )
+
+
+def style_kpi_registry_display(display_df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    """Color-code Status column (Achieved / On Track / At Risk / Behind / Not Set)."""
+    styles = {
+        "Achieved": "background-color: #d1fae5; color: #065f46; font-weight: 600; border-radius: 6px;",
+        "On Track": "background-color: #dbeafe; color: #1e40af; font-weight: 600; border-radius: 6px;",
+        "At Risk": "background-color: #fef3c7; color: #92400e; font-weight: 600; border-radius: 6px;",
+        "Behind": "background-color: #fee2e2; color: #b91c1c; font-weight: 600; border-radius: 6px;",
+        "Not Set": "background-color: #f3f4f6; color: #374151; font-weight: 600; border-radius: 6px;",
+    }
+
+    def _color(val: object) -> str:
+        return styles.get(str(val), "background-color: #f9fafb; color: #111827; font-weight: 500;")
+
+    styler = display_df.style
+    if hasattr(styler, "map"):
+        return styler.map(_color, subset=["Status"])
+    return styler.applymap(_color, subset=["Status"])
+
+
+def build_kpi_registry_df(department: str, overrides: Dict[tuple[str, str, str], Dict[str, str | None]]) -> pd.DataFrame:
+    rows: List[Dict[str, str]] = []
+    for role, kpis in DEPARTMENTS[department]["roles"].items():
+        for k in kpis:
+            key = (department, role, k["metric"])
+            o = overrides.get(key, {})
+            current = str(o.get("current_value") or "")
+            priority = str(o.get("priority") or "P2")
+            frequency = str(o.get("frequency") or "Monthly")
+            raw_so = o.get("status_override")
+            tracking = "Auto" if raw_so in (None, "") else str(raw_so)
+            if tracking == "Auto":
+                status = derive_kpi_status(str(k["target"]), current)
+            else:
+                status = tracking
+            rows.append(
+                {
+                    "KPI Name": k["metric"],
+                    "Category": k["category"],
+                    "Owner": role,
+                    "Target": k["target"],
+                    "Current": current,
+                    "Status": status,
+                    "Priority": priority if priority in KPI_PRIORITY_OPTIONS else "P2",
+                    "Frequency": frequency if frequency in KPI_FREQUENCY_OPTIONS else "Monthly",
+                    "Tracking": tracking if tracking in KPI_TRACKING_OPTIONS else "Auto",
+                    "_dept": department,
+                    "_role": role,
+                    "_metric": k["metric"],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def kpi_management_page() -> None:
+    st.markdown(
+        '<div class="kpi-mgmt-header"><span style="font-size:1.35rem;font-weight:700;color:#0d2f8b;">KPI Management</span><br/>'
+        '<span style="color:#4d5e8b;">Define live tracking for KPIs across departments. Editable fields apply to Admin and Manager roles.</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    h1, h2 = st.columns([3, 1])
+    search_q = h1.text_input("Search", placeholder="Search KPIs or owners...", label_visibility="collapsed")
+    h2.date_input("Period", value=date.today())
+    overrides = fetch_kpi_overrides()
+
+    dept_names = list(DEPARTMENTS.keys())
+    _role = st.session_state.role
+    _ud = (st.session_state.get("user_department") or "").strip()
+    if _role in ("Employee", "Manager") and _ud and _ud in DEPARTMENTS:
+        dept_names = [_ud]
+    elif _role in ("Employee", "Manager") and _ud and _ud not in DEPARTMENTS:
+        st.warning(
+            f"Your profile department «{_ud}» is not in the KPI catalog. Contact an administrator."
+        )
+        dept_names = []
+    if not dept_names:
+        st.info("No department tabs to display.")
+        return
+    counts = {d: sum(len(v) for v in DEPARTMENTS[d]["roles"].values()) for d in dept_names}
+    tab_labels = [f"{d} ({counts[d]})" for d in dept_names]
+    tabs = st.tabs(tab_labels)
+    can_edit = st.session_state.role in ("Admin", "Manager")
+
+    for ti, dept in enumerate(dept_names):
+        with tabs[ti]:
+            base_df = build_kpi_registry_df(dept, overrides)
+            if search_q.strip():
+                q = search_q.strip().lower()
+                mask = (
+                    base_df["KPI Name"].str.lower().str.contains(q, na=False)
+                    | base_df["Owner"].str.lower().str.contains(q, na=False)
+                )
+                df = base_df[mask].copy()
+            else:
+                df = base_df.copy()
+
+            cats = sorted(df["Category"].unique().tolist()) if not df.empty else []
+            stats = sorted(df["Status"].unique().tolist()) if not df.empty else []
+            f1, f2 = st.columns(2)
+            # Keys must be unique across all tabs (Streamlit runs every tab body each rerun).
+            cat_pick = f1.multiselect(
+                "Category filter",
+                ["All"] + cats,
+                default=["All"],
+                key=f"kpi_mgmt_multiselect_category_{ti}",
+            )
+            stat_pick = f2.multiselect(
+                "Status filter",
+                ["All"] + stats,
+                default=["All"],
+                key=f"kpi_mgmt_multiselect_status_{ti}",
+            )
+            if "All" not in cat_pick and cat_pick:
+                df = df[df["Category"].isin(cat_pick)]
+            if "All" not in stat_pick and stat_pick:
+                df = df[df["Status"].isin(stat_pick)]
+
+            def _avg_score(s: str) -> float:
+                m = {"Achieved": 5.0, "On Track": 4.0, "At Risk": 3.0, "Behind": 2.0, "Not Set": 0.0}
+                return m.get(s, 3.0)
+
+            n = len(df)
+            achieved_n = int((df["Status"] == "Achieved").sum()) if n else 0
+            risk_n = int(df["Status"].isin(["At Risk", "Behind"]).sum()) if n else 0
+            avg_s = round(df["Status"].map(_avg_score).mean(), 2) if n else 0.0
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total KPIs", n)
+            m2.metric("Achieved", achieved_n)
+            m3.metric("At Risk / Behind", risk_n)
+            m4.metric("Avg Score", f"{avg_s:.1f} / 5" if n else "—")
+
+            show = df[
+                [
+                    "KPI Name",
+                    "Category",
+                    "Owner",
+                    "Target",
+                    "Current",
+                    "Status",
+                    "Priority",
+                    "Frequency",
+                    "Tracking",
+                ]
+            ].copy()
+
+            legend_cols = st.columns(5)
+            legend_items = [
+                ("Achieved", "#d1fae5", "#065f46"),
+                ("On Track", "#dbeafe", "#1e40af"),
+                ("At Risk", "#fef3c7", "#92400e"),
+                ("Behind", "#fee2e2", "#b91c1c"),
+                ("Not Set", "#f3f4f6", "#374151"),
+            ]
+            for idx, (label, bg, fg) in enumerate(legend_items):
+                legend_cols[idx].markdown(
+                    f'<span style="display:inline-block;padding:4px 10px;border-radius:8px;'
+                    f'background:{bg};color:{fg};font-size:0.78rem;font-weight:600">{label}</span>',
+                    unsafe_allow_html=True,
+                )
+
+            st.caption("Registry overview — Status colors update after you save edits below.")
+            if not show.empty:
+                st.dataframe(
+                    style_kpi_registry_display(show),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(520, 42 + len(show) * 38),
+                )
+
+            edited = None
+            if can_edit:
+                st.markdown("##### Edit tracking")
+                edit_df = show.drop(columns=["Status"], errors="ignore")
+                edited = st.data_editor(
+                    edit_df,
+                    column_config={
+                        "KPI Name": st.column_config.TextColumn("KPI Name", disabled=True),
+                        "Category": st.column_config.TextColumn(disabled=True),
+                        "Owner": st.column_config.TextColumn("Owner", disabled=True),
+                        "Target": st.column_config.TextColumn("Target", disabled=True),
+                        "Current": st.column_config.TextColumn("Current", disabled=False),
+                        "Priority": st.column_config.SelectboxColumn(
+                            "Priority", options=KPI_PRIORITY_OPTIONS, disabled=False
+                        ),
+                        "Frequency": st.column_config.SelectboxColumn(
+                            "Frequency", options=KPI_FREQUENCY_OPTIONS, disabled=False
+                        ),
+                        "Tracking": st.column_config.SelectboxColumn(
+                            "Tracking",
+                            options=KPI_TRACKING_OPTIONS,
+                            disabled=False,
+                            help="Auto = derive status from Target vs Current",
+                        ),
+                    },
+                    hide_index=True,
+                    use_container_width=True,
+                    key=f"kpi_reg_editor_{dept}_{ti}",
+                )
+
+            exp = st.expander("Accessible to: Super Admin, Admin, Manager (edit). Others view-only.")
+            exp.caption("Master KPI definitions come from the EPMS catalog; Current / Priority / Frequency persist in the database.")
+
+            if can_edit and edited is not None and st.button("Save changes", key=f"save_kpi_{dept}_{ti}", type="primary"):
+                for _, row in edited.iterrows():
+                    tr = str(row["Tracking"])
+                    so = None if tr == "Auto" else tr
+                    upsert_kpi_registry_row(
+                        dept,
+                        str(row["Owner"]),
+                        str(row["KPI Name"]),
+                        str(row["Current"]),
+                        str(row["Priority"]),
+                        str(row["Frequency"]),
+                        so,
+                    )
+                st.success("KPI registry updated.")
+                st.rerun()
+
+            csv_out = df.drop(columns=["_dept", "_role", "_metric"], errors="ignore").to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="Export filtered (CSV)",
+                data=csv_out,
+                file_name=f"kpi_registry_{dept.replace(' ', '_')}.csv",
+                mime="text/csv",
+                key=f"dl_csv_{dept}_{ti}",
+            )
+
+            wdf = pd.DataFrame(
+                {"Category": list(CATEGORY_WEIGHTS.keys()), "Weight (%)": list(CATEGORY_WEIGHTS.values())}
+            )
+            fig = px.bar(
+                wdf,
+                x="Weight (%)",
+                y="Category",
+                orientation="h",
+                title="KPI category weightage (universal evaluation)",
+                color="Weight (%)",
+                color_continuous_scale="Blues",
+            )
+            fig.update_layout(showlegend=False, height=320, margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True, key=f"kpi_mgmt_weights_{ti}")
+
+
+def set_user_status(username: str, is_active: bool) -> None:
+    with get_engine().begin() as conn:
+        conn.execute(
+            text("UPDATE users SET is_active = :a WHERE username = :u"),
+            {"a": 1 if is_active else 0, "u": username},
         )
     log_audit(
         "UPDATE_USER_STATUS",
@@ -877,14 +1219,16 @@ def reset_user_password(username: str, new_password: str) -> tuple[bool, str]:
         return False, "Password must be at least 8 characters."
     salt = generate_salt()
     password_hash = hash_password(new_password, salt)
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_engine().begin() as conn:
         conn.execute(
-            """
-            UPDATE users
-            SET password_hash = ?, password_salt = ?
-            WHERE username = ?
-            """,
-            (password_hash, salt, username),
+            text(
+                """
+                UPDATE users
+                SET password_hash = :ph, password_salt = :ps
+                WHERE username = :u
+                """
+            ),
+            {"ph": password_hash, "ps": salt, "u": username},
         )
     log_audit("RESET_PASSWORD", "user", username, "Password reset by admin.")
     return True, "Password reset successfully."
@@ -897,6 +1241,8 @@ def initialize_session() -> None:
         st.session_state.username = ""
     if "role" not in st.session_state:
         st.session_state.role = ""
+    if "user_department" not in st.session_state:
+        st.session_state.user_department = ""
 
 
 def get_rating(score: float) -> str:
@@ -965,6 +1311,7 @@ def login_page() -> None:
                 st.session_state.authenticated = True
                 st.session_state.username = username
                 st.session_state.role = str(user["role"])
+                st.session_state.user_department = str(user.get("department") or "")
                 st.success("Login successful.")
                 st.rerun()
             else:
@@ -990,10 +1337,22 @@ def user_management_page() -> None:
                 manager_options,
                 help="Select manager if the new user is an Employee.",
             )
+            dept_options = [""] + list(DEPARTMENTS.keys())
+            user_department = st.selectbox(
+                "Department (optional scope for Employee/Manager)",
+                dept_options,
+                help="If set, KPI Management and scorecard lists are limited to this department.",
+            )
             create_submit = st.form_submit_button("Create User", use_container_width=True)
         if create_submit:
             assigned_manager = manager_mapping if new_role == "Employee" else ""
-            ok, message = create_user(new_username, new_password, new_role, assigned_manager)
+            ok, message = create_user(
+                new_username,
+                new_password,
+                new_role,
+                assigned_manager,
+                user_department,
+            )
             if ok:
                 st.success(message)
             else:
@@ -1029,6 +1388,22 @@ def user_management_page() -> None:
     st.dataframe(fetch_users(), use_container_width=True, hide_index=True)
     st.subheader("Recent Audit Logs")
     st.dataframe(fetch_audit_logs(150), use_container_width=True, hide_index=True)
+
+    with st.expander("Email (SMTP / AWS SES SMTP)", expanded=False):
+        st.caption(
+            "Configure SMTP via environment variables. Recommended: AWS SES SMTP credentials. "
+            "Required: EPMS_SMTP_HOST, EPMS_SMTP_PORT, EPMS_EMAIL_FROM, EPMS_SMTP_USERNAME, EPMS_SMTP_PASSWORD."
+        )
+        to_email = st.text_input("To", placeholder="recipient@example.com", key="email_to")
+        subject = st.text_input("Subject", value="EPMS Test Email", key="email_subject")
+        body = st.text_area("Message", value="Hello from EPMS.", key="email_body")
+        if st.button("Send test email", type="primary", use_container_width=True, key="email_send_btn"):
+            ok, msg = send_email_smtp(to_email=to_email, subject=subject, body=body)
+            if ok:
+                st.success(msg)
+                log_audit("SEND_EMAIL", "email", to_email, f"Subject={subject}")
+            else:
+                st.error(msg)
 
 
 def dashboard_page() -> None:
@@ -1135,8 +1510,13 @@ def scorecard_page() -> None:
             return
 
     departments = list(DEPARTMENTS.keys())
+    ud = (st.session_state.get("user_department") or "").strip()
+    if role in ("Employee", "Manager") and ud and ud in DEPARTMENTS:
+        departments = [ud]
     c1, c2 = st.columns(2)
     default_department = edit_record["department"] if edit_record else departments[0]
+    if default_department not in departments:
+        default_department = departments[0]
     department = c1.selectbox("Department", departments, index=departments.index(default_department))
     roles = list(DEPARTMENTS[department]["roles"].keys())
     default_role = edit_record["role"] if edit_record and edit_record["role"] in roles else roles[0]
@@ -1279,7 +1659,7 @@ def scorecard_page() -> None:
             st.success("Scorecard updated successfully.")
         else:
             save_scorecard(record)
-            st.success("Scorecard saved successfully. Data is persisted in SQLite and visible in Reports.")
+            st.success("Scorecard saved successfully. Data is persisted and visible in Reports.")
 
 
 def review_workflow_page() -> None:
@@ -1451,14 +1831,27 @@ def main() -> None:
         return
 
     st.sidebar.title("KamglobalAI EPMS")
-    st.sidebar.caption(f"User: {st.session_state.username} ({st.session_state.role})")
+    dept_note = (st.session_state.get("user_department") or "").strip()
+    sidebar_user = f"User: {st.session_state.username} ({st.session_state.role})"
+    if dept_note:
+        sidebar_user += f" · Dept: {dept_note}"
+    st.sidebar.caption(sidebar_user)
     st.sidebar.caption(f"DB Backend: {DB_CONFIG.backend}")
 
     allowed_pages_by_role = {
-        "Admin": ["Dashboard", "Scorecard Entry", "Review Workflow", "Calibration", "Cycle Controls", "Reports", "User Management"],
-        "Manager": ["Dashboard", "Scorecard Entry", "Review Workflow", "Calibration", "Reports"],
-        "Employee": ["Dashboard", "Scorecard Entry", "Reports"],
-        "Viewer": ["Dashboard", "Reports"],
+        "Admin": [
+            "Dashboard",
+            "KPI Management",
+            "Scorecard Entry",
+            "Review Workflow",
+            "Calibration",
+            "Cycle Controls",
+            "Reports",
+            "User Management",
+        ],
+        "Manager": ["Dashboard", "KPI Management", "Scorecard Entry", "Review Workflow", "Calibration", "Reports"],
+        "Employee": ["Dashboard", "KPI Management", "Scorecard Entry", "Reports"],
+        "Viewer": ["Dashboard", "KPI Management", "Reports"],
     }
     pages = allowed_pages_by_role.get(st.session_state.role, ["Dashboard"])
     page = st.sidebar.radio("Go to", pages)
@@ -1467,10 +1860,13 @@ def main() -> None:
         st.session_state.authenticated = False
         st.session_state.username = ""
         st.session_state.role = ""
+        st.session_state.user_department = ""
         st.rerun()
 
     if page == "Dashboard":
         dashboard_page()
+    elif page == "KPI Management":
+        kpi_management_page()
     elif page == "Scorecard Entry":
         scorecard_page()
     elif page == "Review Workflow":
