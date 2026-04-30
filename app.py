@@ -20,15 +20,13 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from dotenv import load_dotenv
 
 from epms import auth as auth_module
-from epms import db_adapter as db_adapter_module
 from epms import db as db_module
 from epms import reports as reports_module
 from epms import ui as ui_module
 from epms.emailer import send_email_smtp
-from epms.schema_meta import insert_scorecard_returning_id
-from epms.sql_engine import dialect_name, get_engine
-from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from epms.mongo import get_db
+from pymongo.errors import DuplicateKeyError
+from bson import ObjectId
 
 load_dotenv()
 
@@ -41,7 +39,7 @@ st.set_page_config(
 )
 
 DB_PATH = Path(os.getenv("EPMS_DB_PATH", "epms.db"))
-DB_CONFIG = db_adapter_module.build_database_config(DB_PATH)
+DB_BACKEND = "mongodb"
 DEFAULT_ADMIN_USERNAME = os.getenv("EPMS_ADMIN_USERNAME", "admin")
 DEFAULT_ADMIN_PASSWORD = os.getenv("EPMS_ADMIN_PASSWORD", "Admin@123")
 WORKFLOW_STATUSES = ["Draft", "Submitted", "Manager Reviewed", "Calibrated", "Finalized"]
@@ -457,64 +455,73 @@ def init_db() -> None:
     )
 
 
+def _oid(value: str | ObjectId) -> ObjectId:
+    if isinstance(value, ObjectId):
+        return value
+    return ObjectId(str(value))
+
+
 def fetch_review_cycles() -> pd.DataFrame:
-    with get_engine().connect() as conn:
-        return pd.read_sql_query(
-            "SELECT cycle_name, is_closed, updated_at FROM review_cycles ORDER BY cycle_name",
-            conn,
-        )
+    db = get_db()
+    rows = list(db["review_cycles"].find({}, {"_id": 0}))
+    if not rows:
+        return pd.DataFrame(columns=["cycle_name", "is_closed", "updated_at"])
+    df = pd.DataFrame(rows)
+    if "cycle_name" in df.columns:
+        df = df.sort_values("cycle_name")
+    return df
 
 
 def is_cycle_closed(cycle_name: str) -> bool:
     if not cycle_name:
         return False
-    with get_engine().connect() as conn:
-        row = conn.execute(
-            text("SELECT is_closed FROM review_cycles WHERE cycle_name = :c"),
-            {"c": cycle_name},
-        ).fetchone()
-    return bool(row[0]) if row else False
+    db = get_db()
+    doc = db["review_cycles"].find_one({"cycle_name": cycle_name}, {"is_closed": 1})
+    if not doc:
+        return False
+    return bool(doc.get("is_closed"))
 
 
 def set_cycle_closed(cycle_name: str, is_closed: bool) -> None:
-    with get_engine().begin() as conn:
-        conn.execute(
-            text(
-                """
-                UPDATE review_cycles
-                SET is_closed = :closed, updated_at = :ts
-                WHERE cycle_name = :c
-                """
-            ),
-            {"closed": 1 if is_closed else 0, "ts": datetime.now().isoformat(), "c": cycle_name},
-        )
+    db = get_db()
+    db["review_cycles"].update_one(
+        {"cycle_name": cycle_name},
+        {"$set": {"is_closed": 1 if is_closed else 0, "updated_at": datetime.now().isoformat()}},
+        upsert=True,
+    )
     state = "CLOSED" if is_closed else "OPENED"
     log_audit("UPDATE_CYCLE_STATUS", "review_cycle", cycle_name, f"Cycle={cycle_name};State={state}")
 
 
 def log_audit(action: str, entity_type: str, entity_id: str, details: str) -> None:
     actor = st.session_state.get("username", "system")
-    with get_engine().begin() as conn:
-        conn.execute(
-            text(
-                """
-                INSERT INTO audit_logs (created_at, actor, action, entity_type, entity_id, details)
-                VALUES (:ts, :actor, :action, :etype, :eid, :details)
-                """
-            ),
-            {
-                "ts": datetime.now().isoformat(),
-                "actor": actor,
-                "action": action,
-                "etype": entity_type,
-                "eid": entity_id,
-                "details": details,
-            },
-        )
+    db = get_db()
+    db["audit_logs"].insert_one(
+        {
+            "created_at": datetime.now().isoformat(),
+            "actor": actor,
+            "action": action,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "details": details,
+        }
+    )
 
 
 def save_scorecard(record: Dict[str, str | float]) -> None:
-    params = {
+    db = get_db()
+    kpis = []
+    breakdown = []
+    try:
+        kpis = json.loads(str(record.get("kpi_json", "[]") or "[]"))
+    except json.JSONDecodeError:
+        kpis = []
+    try:
+        breakdown = json.loads(str(record.get("breakdown_json", "[]") or "[]"))
+    except json.JSONDecodeError:
+        breakdown = []
+
+    doc = {
         "created_at": str(record["created_at"]),
         "review_date": str(record["review_date"]),
         "employee_name": str(record["employee_name"]),
@@ -522,17 +529,16 @@ def save_scorecard(record: Dict[str, str | float]) -> None:
         "role": str(record["role"]),
         "final_score": float(record["final_score"]),
         "rating": str(record["rating"]),
-        "kpi_json": str(record["kpi_json"]),
-        "breakdown_json": str(record["breakdown_json"]),
         "created_by": str(record["created_by"]),
         "review_cycle": str(record.get("review_cycle", "")),
         "status": str(record.get("status", "Submitted")),
         "self_comment": str(record.get("self_comment", "")),
         "manager_comment": str(record.get("manager_comment", "")),
         "evidence_url": str(record.get("evidence_url", "")),
+        "kpis": kpis,
+        "breakdown": breakdown,
     }
-    with get_engine().begin() as conn:
-        new_id = insert_scorecard_returning_id(conn, dialect_name(), params)
+    new_id = db["scorecards"].insert_one(doc).inserted_id
     log_audit(
         "CREATE_SCORECARD",
         "scorecard",
@@ -542,7 +548,7 @@ def save_scorecard(record: Dict[str, str | float]) -> None:
 
 
 def update_scorecard(
-    scorecard_id: int,
+    scorecard_id: str,
     review_date: str,
     employee_name: str,
     department: str,
@@ -556,35 +562,37 @@ def update_scorecard(
     self_comment: str,
     evidence_url: str,
 ) -> None:
-    with get_engine().begin() as conn:
-        conn.execute(
-            text(
-                """
-                UPDATE scorecards
-                SET review_date = :review_date, employee_name = :employee_name, department = :department,
-                    role = :role, final_score = :final_score, rating = :rating,
-                    kpi_json = :kpi_json, breakdown_json = :breakdown_json,
-                    review_cycle = :review_cycle, status = :status,
-                    self_comment = :self_comment, evidence_url = :evidence_url
-                WHERE id = :id
-                """
-            ),
-            {
+    db = get_db()
+    kpis = []
+    breakdown = []
+    try:
+        kpis = json.loads(kpi_json or "[]")
+    except json.JSONDecodeError:
+        kpis = []
+    try:
+        breakdown = json.loads(breakdown_json or "[]")
+    except json.JSONDecodeError:
+        breakdown = []
+
+    db["scorecards"].update_one(
+        {"_id": _oid(scorecard_id)},
+        {
+            "$set": {
                 "review_date": review_date,
                 "employee_name": employee_name,
                 "department": department,
                 "role": role,
-                "final_score": final_score,
+                "final_score": float(final_score),
                 "rating": rating,
-                "kpi_json": kpi_json,
-                "breakdown_json": breakdown_json,
                 "review_cycle": review_cycle,
                 "status": status,
                 "self_comment": self_comment,
                 "evidence_url": evidence_url,
-                "id": scorecard_id,
-            },
-        )
+                "kpis": kpis,
+                "breakdown": breakdown,
+            }
+        },
+    )
     log_audit("UPDATE_SCORECARD", "scorecard", str(scorecard_id), f"Status={status}")
 
 
@@ -594,79 +602,89 @@ def fetch_scorecards(
     review_cycle: str | None = None,
     status: str | None = None,
 ) -> pd.DataFrame:
-    query = """
-            SELECT
-                id, created_at, review_date, employee_name, department, role,
-                final_score, rating, created_by, review_cycle, status, self_comment, manager_comment, evidence_url
-            FROM scorecards
-            WHERE 1=1
-        """
-    params: dict[str, str] = {}
+    db = get_db()
+    q: dict = {}
     if department:
-        query += " AND department = :department"
-        params["department"] = department
+        q["department"] = department
     if role:
-        query += " AND role = :role"
-        params["role"] = role
+        q["role"] = role
     if review_cycle:
-        query += " AND review_cycle = :review_cycle"
-        params["review_cycle"] = review_cycle
+        q["review_cycle"] = review_cycle
     if status:
-        query += " AND status = :status"
-        params["status"] = status
-    query += " ORDER BY id DESC"
-    with get_engine().connect() as conn:
-        return pd.read_sql_query(text(query), conn, params=params or None)
+        q["status"] = status
+
+    projection = {
+        "_id": 1,
+        "created_at": 1,
+        "review_date": 1,
+        "employee_name": 1,
+        "department": 1,
+        "role": 1,
+        "final_score": 1,
+        "rating": 1,
+        "created_by": 1,
+        "review_cycle": 1,
+        "status": 1,
+        "self_comment": 1,
+        "manager_comment": 1,
+        "evidence_url": 1,
+    }
+    docs = list(db["scorecards"].find(q, projection).sort("created_at", -1))
+    if not docs:
+        return pd.DataFrame(
+            columns=[
+                "id",
+                "created_at",
+                "review_date",
+                "employee_name",
+                "department",
+                "role",
+                "final_score",
+                "rating",
+                "created_by",
+                "review_cycle",
+                "status",
+                "self_comment",
+                "manager_comment",
+                "evidence_url",
+            ]
+        )
+    for d in docs:
+        d["id"] = str(d.pop("_id"))
+    return pd.DataFrame(docs)
 
 
-def fetch_scorecard_by_id(scorecard_id: int) -> dict | None:
-    with get_engine().connect() as conn:
-        row = conn.execute(
-            text(
-                """
-                SELECT
-                    id, review_date, employee_name, department, role,
-                    final_score, rating, kpi_json, breakdown_json, created_by,
-                    review_cycle, status, self_comment, manager_comment, evidence_url
-                FROM scorecards
-                WHERE id = :id
-                """
-            ),
-            {"id": scorecard_id},
-        ).fetchone()
-    if not row:
+def fetch_scorecard_by_id(scorecard_id: str) -> dict | None:
+    db = get_db()
+    doc = db["scorecards"].find_one({"_id": _oid(scorecard_id)})
+    if not doc:
         return None
     return {
-        "id": row[0],
-        "review_date": row[1],
-        "employee_name": row[2],
-        "department": row[3],
-        "role": row[4],
-        "final_score": row[5],
-        "rating": row[6],
-        "kpi_json": row[7],
-        "breakdown_json": row[8],
-        "created_by": row[9],
-        "review_cycle": row[10],
-        "status": row[11],
-        "self_comment": row[12] or "",
-        "manager_comment": row[13] or "",
-        "evidence_url": row[14] or "",
+        "id": str(doc.get("_id")),
+        "review_date": doc.get("review_date", ""),
+        "employee_name": doc.get("employee_name", ""),
+        "department": doc.get("department", ""),
+        "role": doc.get("role", ""),
+        "final_score": float(doc.get("final_score") or 0.0),
+        "rating": doc.get("rating", ""),
+        "kpi_json": json.dumps(doc.get("kpis") or []),
+        "breakdown_json": json.dumps(doc.get("breakdown") or []),
+        "created_by": doc.get("created_by", ""),
+        "review_cycle": doc.get("review_cycle", ""),
+        "status": doc.get("status", ""),
+        "self_comment": doc.get("self_comment") or "",
+        "manager_comment": doc.get("manager_comment") or "",
+        "evidence_url": doc.get("evidence_url") or "",
+        "created_at": doc.get("created_at", ""),
     }
 
 
-def update_scorecard_workflow(scorecard_id: int, status: str, manager_comment: str) -> None:
-    with get_engine().begin() as conn:
-        conn.execute(
-            text(
-                """
-                UPDATE scorecards
-                SET status = :status, manager_comment = :mcomment
-                WHERE id = :id
-                """
-            ),
-            {"status": status, "mcomment": manager_comment, "id": scorecard_id},
-        )
+def update_scorecard_workflow(scorecard_id: str, status: str, manager_comment: str) -> None:
+    db = get_db()
+    db["scorecards"].update_one(
+        {"_id": _oid(scorecard_id)},
+        {"$set": {"status": status, "manager_comment": manager_comment}},
+    )
     log_audit(
         "UPDATE_WORKFLOW",
         "scorecard",
@@ -677,43 +695,31 @@ def update_scorecard_workflow(scorecard_id: int, status: str, manager_comment: s
 
 def fetch_audit_logs(limit: int = 300) -> pd.DataFrame:
     lim = max(1, min(int(limit), 5000))
-    with get_engine().connect() as conn:
-        return pd.read_sql_query(
-            text(
-                """
-                SELECT created_at, actor, action, entity_type, entity_id, details
-                FROM audit_logs
-                ORDER BY id DESC
-                LIMIT :lim
-                """
-            ),
-            conn,
-            params={"lim": lim},
-        )
+    db = get_db()
+    docs = list(
+        db["audit_logs"]
+        .find({}, {"_id": 0, "created_at": 1, "actor": 1, "action": 1, "entity_type": 1, "entity_id": 1, "details": 1})
+        .sort("created_at", -1)
+        .limit(lim)
+    )
+    if not docs:
+        return pd.DataFrame(columns=["created_at", "actor", "action", "entity_type", "entity_id", "details"])
+    return pd.DataFrame(docs)
 
 
 def get_user_by_username(username: str) -> dict | None:
-    with get_engine().connect() as conn:
-        row = conn.execute(
-            text(
-                """
-                SELECT username, role, password_hash, password_salt, is_active, manager_username, department
-                FROM users
-                WHERE username = :u
-                """
-            ),
-            {"u": username},
-        ).fetchone()
-    if not row:
+    db = get_db()
+    doc = db["users"].find_one({"username": username}, {"_id": 0})
+    if not doc:
         return None
     return {
-        "username": row[0],
-        "role": row[1],
-        "password_hash": row[2],
-        "password_salt": row[3],
-        "is_active": bool(row[4]),
-        "manager_username": row[5] or "",
-        "department": row[6] or "",
+        "username": doc.get("username", ""),
+        "role": doc.get("role", ""),
+        "password_hash": doc.get("password_hash", ""),
+        "password_salt": doc.get("password_salt", ""),
+        "is_active": bool(doc.get("is_active", 0)),
+        "manager_username": doc.get("manager_username") or "",
+        "department": doc.get("department") or "",
     }
 
 
@@ -735,28 +741,20 @@ def create_user(
     mgr = manager_username.strip() if manager_username and manager_username.strip() else None
     dept = department.strip() if department and department.strip() else None
     try:
-        with get_engine().begin() as conn:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO users (
-                        username, role, password_hash, password_salt,
-                        manager_username, department, is_active, created_at
-                    )
-                    VALUES (:u, :role, :ph, :ps, :mgr, :dept, 1, :ts)
-                    """
-                ),
-                {
-                    "u": username,
-                    "role": role,
-                    "ph": password_hash,
-                    "ps": salt,
-                    "mgr": mgr,
-                    "dept": dept,
-                    "ts": datetime.now().isoformat(),
-                },
-            )
-    except IntegrityError:
+        db = get_db()
+        db["users"].insert_one(
+            {
+                "username": username,
+                "role": role,
+                "password_hash": password_hash,
+                "password_salt": salt,
+                "manager_username": mgr,
+                "department": dept,
+                "is_active": 1,
+                "created_at": datetime.now().isoformat(),
+            }
+        )
+    except DuplicateKeyError:
         return False, "Username already exists."
     log_audit(
         "CREATE_USER",
@@ -768,30 +766,25 @@ def create_user(
 
 
 def fetch_users() -> pd.DataFrame:
-    with get_engine().connect() as conn:
-        query = """
-            SELECT id, username, role, manager_username, department, is_active, created_at
-            FROM users
-            ORDER BY username ASC
-        """
-        users_df = pd.read_sql_query(query, conn)
-    users_df["is_active"] = users_df["is_active"].map({1: "Yes", 0: "No"})
+    db = get_db()
+    docs = list(
+        db["users"]
+        .find({}, {"username": 1, "role": 1, "manager_username": 1, "department": 1, "is_active": 1, "created_at": 1})
+        .sort("username", 1)
+    )
+    if not docs:
+        return pd.DataFrame(columns=["id", "username", "role", "manager_username", "department", "is_active", "created_at"])
+    for d in docs:
+        d["id"] = str(d.pop("_id"))
+    users_df = pd.DataFrame(docs)
+    users_df["is_active"] = users_df["is_active"].map({1: "Yes", 0: "No"}).fillna("No")
     return users_df
 
 
 def fetch_team_usernames(manager_username: str) -> list[str]:
-    with get_engine().connect() as conn:
-        rows = conn.execute(
-            text(
-                """
-                SELECT username
-                FROM users
-                WHERE manager_username = :m AND is_active = 1
-                """
-            ),
-            {"m": manager_username},
-        ).fetchall()
-    return [row[0] for row in rows]
+    db = get_db()
+    docs = db["users"].find({"manager_username": manager_username, "is_active": 1}, {"username": 1})
+    return [d.get("username", "") for d in docs]
 
 
 def get_visible_scorecards_for_current_user(**filters: str | None) -> pd.DataFrame:
@@ -889,22 +882,18 @@ def derive_kpi_status(target: str, current: str) -> str:
 
 
 def fetch_kpi_overrides() -> Dict[tuple[str, str, str], Dict[str, str | None]]:
-    with get_engine().connect() as conn:
-        rows = conn.execute(
-            text(
-                """
-                SELECT department, role, metric, current_value, priority, frequency, status_override
-                FROM kpi_registry_overrides
-                """
-            )
-        ).fetchall()
     out: Dict[tuple[str, str, str], Dict[str, str | None]] = {}
-    for r in rows:
-        out[(r[0], r[1], r[2])] = {
-            "current_value": r[3] or "",
-            "priority": r[4] or "P2",
-            "frequency": r[5] or "Monthly",
-            "status_override": r[6],
+    db = get_db()
+    docs = db["kpi_registry_overrides"].find(
+        {},
+        {"department": 1, "role": 1, "metric": 1, "current_value": 1, "priority": 1, "frequency": 1, "status_override": 1},
+    )
+    for d in docs:
+        out[(d.get("department", ""), d.get("role", ""), d.get("metric", ""))] = {
+            "current_value": d.get("current_value") or "",
+            "priority": d.get("priority") or "P2",
+            "frequency": d.get("frequency") or "Monthly",
+            "status_override": d.get("status_override"),
         }
     return out
 
@@ -920,34 +909,21 @@ def upsert_kpi_registry_row(
 ) -> None:
     ts = datetime.now().isoformat()
     so = status_override if status_override and status_override != "Auto" else None
-    with get_engine().begin() as conn:
-        conn.execute(
-            text(
-                """
-                INSERT INTO kpi_registry_overrides (
-                    department, role, metric, current_value, priority, frequency, status_override, updated_at
-                ) VALUES (
-                    :dept, :role, :metric, :cur, :prio, :freq, :so, :ts
-                )
-                ON CONFLICT(department, role, metric) DO UPDATE SET
-                    current_value = excluded.current_value,
-                    priority = excluded.priority,
-                    frequency = excluded.frequency,
-                    status_override = excluded.status_override,
-                    updated_at = excluded.updated_at
-                """
-            ),
-            {
-                "dept": department,
-                "role": role,
-                "metric": metric,
-                "cur": current_value,
-                "prio": priority,
-                "freq": frequency,
-                "so": so,
-                "ts": ts,
+    db = get_db()
+    db["kpi_registry_overrides"].update_one(
+        {"department": department, "role": role, "metric": metric},
+        {
+            "$set": {
+                "current_value": current_value,
+                "priority": priority,
+                "frequency": frequency,
+                "status_override": so,
+                "updated_at": ts,
             },
-        )
+            "$setOnInsert": {"department": department, "role": role, "metric": metric},
+        },
+        upsert=True,
+    )
     log_audit(
         "KPI_REGISTRY_UPSERT",
         "kpi_registry",
@@ -1201,11 +1177,8 @@ def kpi_management_page() -> None:
 
 
 def set_user_status(username: str, is_active: bool) -> None:
-    with get_engine().begin() as conn:
-        conn.execute(
-            text("UPDATE users SET is_active = :a WHERE username = :u"),
-            {"a": 1 if is_active else 0, "u": username},
-        )
+    db = get_db()
+    db["users"].update_one({"username": username}, {"$set": {"is_active": 1 if is_active else 0}})
     log_audit(
         "UPDATE_USER_STATUS",
         "user",
@@ -1219,17 +1192,8 @@ def reset_user_password(username: str, new_password: str) -> tuple[bool, str]:
         return False, "Password must be at least 8 characters."
     salt = generate_salt()
     password_hash = hash_password(new_password, salt)
-    with get_engine().begin() as conn:
-        conn.execute(
-            text(
-                """
-                UPDATE users
-                SET password_hash = :ph, password_salt = :ps
-                WHERE username = :u
-                """
-            ),
-            {"ph": password_hash, "ps": salt, "u": username},
-        )
+    db = get_db()
+    db["users"].update_one({"username": username}, {"$set": {"password_hash": password_hash, "password_salt": salt}})
     log_audit("RESET_PASSWORD", "user", username, "Password reset by admin.")
     return True, "Password reset successfully."
 
@@ -1501,7 +1465,7 @@ def scorecard_page() -> None:
         selectable = editable_df[["id", "employee_name", "department", "role", "status", "review_cycle"]]
         st.dataframe(selectable, use_container_width=True, hide_index=True)
         selected_id = st.selectbox("Select Record ID", selectable["id"].tolist())
-        edit_record = fetch_scorecard_by_id(int(selected_id))
+        edit_record = fetch_scorecard_by_id(str(selected_id))
         if not edit_record:
             st.error("Selected record not found.")
             return
@@ -1642,7 +1606,7 @@ def scorecard_page() -> None:
                 st.error(reason)
                 return
             update_scorecard(
-                scorecard_id=int(edit_record["id"]),
+                scorecard_id=str(edit_record["id"]),
                 review_date=str(review_date),
                 employee_name=employee_name.strip(),
                 department=department,
@@ -1689,7 +1653,7 @@ def review_workflow_page() -> None:
         if is_cycle_closed(str(selected_record["review_cycle"] or "")):
             st.error(f"{selected_record['review_cycle']} is closed. Workflow updates are locked.")
             return
-        update_scorecard_workflow(int(selected_id), next_status, manager_comment.strip())
+        update_scorecard_workflow(str(selected_id), next_status, manager_comment.strip())
         st.success(f"Scorecard {selected_id} moved to {next_status}.")
         st.rerun()
 
@@ -1836,7 +1800,7 @@ def main() -> None:
     if dept_note:
         sidebar_user += f" · Dept: {dept_note}"
     st.sidebar.caption(sidebar_user)
-    st.sidebar.caption(f"DB Backend: {DB_CONFIG.backend}")
+    st.sidebar.caption(f"DB Backend: {DB_BACKEND}")
 
     allowed_pages_by_role = {
         "Admin": [

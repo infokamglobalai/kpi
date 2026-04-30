@@ -1,6 +1,6 @@
 # KamglobalAI EPMS
 
-Enterprise Performance Management System (EPMS) built with Streamlit; uses SQLite locally or PostgreSQL when `EPMS_DATABASE_URL` is set.
+Enterprise Performance Management System (EPMS) built with Streamlit; uses MongoDB (Atlas) for persistence.
 
 ## Features
 
@@ -18,7 +18,7 @@ Enterprise Performance Management System (EPMS) built with Streamlit; uses SQLit
 
 - Python
 - Streamlit
-- SQLite or PostgreSQL (via SQLAlchemy)
+- MongoDB (Atlas) via `pymongo`
 - Plotly
 - Pandas
 - ReportLab
@@ -69,39 +69,51 @@ Change password immediately after first login.
 
 ## Production Notes
 
-- Database file: `epms.db` (auto-created and migrated at startup)
-- Keep regular backups of `epms.db`
+- Configure MongoDB Atlas and keep backups/snapshots enabled there.
 - Use strong admin password and disable unused accounts
 - For internet-facing deployment, place behind reverse proxy and HTTPS
 - Configure environment variables for production-safe defaults:
-  - `EPMS_DB_PATH` (default: `epms.db`)
-  - `EPMS_DATABASE_URL` (optional, example: `postgresql+psycopg2://user:pass@host:5432/epms`)
+  - `EPMS_MONGODB_URI`
+  - `EPMS_MONGODB_DBNAME` (default: `epms`)
   - `EPMS_ADMIN_USERNAME` (default: `admin`)
   - `EPMS_ADMIN_PASSWORD` (default: `Admin@123`)
   - Email (SMTP / AWS SES SMTP):
     - `EPMS_SMTP_HOST`, `EPMS_SMTP_PORT`, `EPMS_SMTP_USERNAME`, `EPMS_SMTP_PASSWORD`
     - `EPMS_EMAIL_FROM`, `EPMS_SMTP_STARTTLS`
 
-## AWS Deployment (Recommended: RDS + ECS/Fargate + SES SMTP)
+## One-time data migration (from SQLite/Postgres to MongoDB)
+
+Run:
+
+```powershell
+python .\\scripts\\migrate_to_mongo.py
+```
+
+Source selection:
+
+- If `EPMS_DATABASE_URL` is set → migrates from Postgres
+- Else → migrates from the SQLite file at `EPMS_DB_PATH` (default `epms.db`)
+
+## AWS Deployment (Recommended: MongoDB Atlas + ECS/Fargate + SES SMTP)
 
 This app is container-ready (see `Dockerfile`). The common AWS production setup is:
 
-- **RDS PostgreSQL** for persistence
+- **MongoDB Atlas** for persistence
 - **ECS/Fargate** to run the Streamlit container
 - **Application Load Balancer (ALB)** + **ACM** for HTTPS + custom domain
 - **SES** for outgoing email (via SMTP)
 
-### 1) Create RDS PostgreSQL
+### 1) Create MongoDB Atlas cluster
 
-- **Engine**: PostgreSQL 15+ (any supported version is OK)
-- **Public access**: No (recommended)
-- **Security Group**:
-  - Inbound: allow TCP `5432` from the **ECS task security group** only
-- Note the endpoint, DB name, username, password.
+- Create a cluster and database user.
+- Copy the connection string and set:
+  - `EPMS_MONGODB_URI`
+  - `EPMS_MONGODB_DBNAME`
 
-Set `EPMS_DATABASE_URL` like:
+Network access:
 
-`postgresql+psycopg2://USER:PASSWORD@RDS_ENDPOINT:5432/DBNAME`
+- Quick start (less secure): allowlist the **NAT gateway public IP** used by your ECS tasks
+- Better: use **Atlas Private Endpoint** (recommended for production)
 
 ### 2) Enable AWS SES (Email)
 
@@ -137,10 +149,11 @@ docker push <acct>.dkr.ecr.<region>.amazonaws.com/kpi-epms:latest
   - Health check (ALB): path `/` (Streamlit responds with 200)
   - Logging: CloudWatch Logs
   - Environment variables (set in task definition), **do not use `.env` in production**:
-    - `EPMS_DATABASE_URL`
+    - `EPMS_MONGODB_URI`
+    - `EPMS_MONGODB_DBNAME`
     - `EPMS_ADMIN_USERNAME`, `EPMS_ADMIN_PASSWORD`, `EPMS_ENABLE_ADMIN_SEED`
     - `EPMS_SMTP_*` and `EPMS_EMAIL_FROM`
-  - Prefer AWS Secrets Manager for DB password and SMTP password
+  - Prefer AWS Secrets Manager for MongoDB URI (or password) and SMTP password
 - **Networking**:
   - Private subnets (recommended)
   - Security group inbound: allow `8501` from the ALB security group only
